@@ -345,7 +345,7 @@ pnpm install            # postinstall (scripts/postinstall.mjs) is a no-op on Wi
 pnpm build              # shared → bridge, plugin, hooks
 pnpm test               # optional: run the Vitest suite
 
-# Register Claude Code hooks (writes a PowerShell one-liner hook command)
+# Register Claude Code hooks (writes the %USERPROFILE%\.agentdeck\claude-hook.ps1 sidecar + -File hook commands)
 node hooks/dist/install.js
 
 # Link the CLI + Stream Deck plugin
@@ -365,7 +365,7 @@ agentdeck claude        # spawns Claude Code via Windows ConPTY (cmd.exe /d /s /
 
 - **Data dir** — `%USERPROFILE%\.agentdeck\` (same layout as macOS `~/.agentdeck/`). `AGENTDECK_DATA_DIR` override still works.
 - **PTY** — ConPTY through `cmd.exe` with `/d /s /c` (POSIX uses `/bin/zsh -l -c`). `node-pty`'s Windows prebuild is used as-is, so no Visual Studio Build Tools are required.
-- **Hooks** — Claude Code hook entries run a `powershell -NoProfile -ExecutionPolicy Bypass -Command "…"` one-liner that reads `daemon.json`, probes `/health`, and POSTs the payload via `Invoke-RestMethod`.
+- **Hooks** — Claude Code hook entries run `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<home>/.agentdeck/claude-hook.ps1" <Event>`; the sidecar script reads `daemon.json`, probes `/health`, and POSTs the payload. The command line deliberately contains no `$`: Claude Code executes hook commands through **git-bash** on Windows (not cmd.exe), which $-expands inline PowerShell variables to empty and produces unrecoverable parse errors — the reason the previous inline `-Command` one-liner was replaced.
 - **`agentdeck daemon install` / `uninstall`** — registers a per-user **Scheduled Task** `AgentDeckDaemon` with a logon trigger (built-in `schtasks.exe`, no admin elevation), the Windows analog of the macOS LaunchAgent. `install` registers + starts it now and installs Codex hooks; `uninstall` stops the daemon and removes the task. A real Windows Service is intentionally **not** used — it runs in session 0 with no desktop/device access, breaking USB-HID (D200H), audio (wake-word), and the Stream Deck app. See [docs/daemon.md → Autostart](docs/daemon.md#autostart-loginlogon).
 - **Device modules** — `adb` is probed cross-platform; the `/dev/tty.*` USB-serial scan is skipped on Windows (COM-port enumeration not implemented). mDNS, `node-hid` (D200H), and `better-sqlite3` (APME) use Windows-compatible prebuilds.
 - **APME hardware sampler** is darwin-only — it returns a minimal snapshot on Windows and the recommender treats that as "neutral".

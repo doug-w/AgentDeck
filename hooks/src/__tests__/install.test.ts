@@ -1,27 +1,38 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   HOOK_EVENTS,
   buildHookCommand,
   buildHookCommandWin,
   buildHookEntry,
+  claudeHookScriptContent,
+  isAgentDeckHookCommand,
   applyHooks,
   removeHooks,
   migrateHooks,
+  installHooks,
+  uninstallHooks,
+  migrateHooksIfNeeded,
 } from '../install.js';
 
 describe('Hook Installer', () => {
   describe('buildHookEntry', () => {
-    it('creates matcher-group format with AGENTDECK_PORT env var', () => {
-      const entry = buildHookEntry('SessionStart');
+    it('creates matcher-group format with AGENTDECK_PORT env var (POSIX)', () => {
+      const entry = buildHookEntry('SessionStart', { platform: 'linux' });
       expect(entry.matcher).toBe('');
       expect(entry.hooks).toHaveLength(1);
       expect(entry.hooks[0].type).toBe('command');
-      // Both POSIX and Windows commands reference AGENTDECK_PORT and the event name.
-      // POSIX inlines the full `/hooks/<event>` path; Windows builds it via `/hooks/`+$ev,
-      // so assert both substrings without assuming a single concatenated form.
       expect(entry.hooks[0].command).toContain('AGENTDECK_PORT');
       expect(entry.hooks[0].command).toContain('SessionStart');
       expect(entry.hooks[0].command).toContain('/hooks/');
+    });
+
+    it('emits the `-File` sidecar pointer on win32', () => {
+      const entry = buildHookEntry('SessionStart', { platform: 'win32' });
+      expect(entry.hooks[0].command).toContain('claude-hook.ps1');
+      expect(entry.hooks[0].command).toContain('SessionStart');
     });
 
     it('uses `*` matcher for tool events and empty matcher for lifecycle events', () => {
@@ -56,49 +67,96 @@ describe('Hook Installer', () => {
   });
 
   describe('buildHookCommandWin (Windows)', () => {
-    it('wraps a PowerShell one-liner that targets the event endpoint', () => {
-      const cmd = buildHookCommandWin('SessionStart');
-      expect(cmd.startsWith('powershell -NoProfile -ExecutionPolicy Bypass -Command "')).toBe(true);
-      expect(cmd).toContain("$ev='SessionStart'");
-      expect(cmd).toContain('$env:AGENTDECK_PORT');
-      expect(cmd).toContain(".agentdeck\\daemon.json");
-      expect(cmd).toContain("/hooks/'+$ev");
-      expect(cmd).toContain('Invoke-RestMethod');
-      expect(cmd).toContain('$port=9120');
+    it('emits a bare -File pointer to the sidecar with the event name as argument', () => {
+      const cmd = buildHookCommandWin('SessionStart', 'C:\\Users\\Doug Warren\\.agentdeck\\claude-hook.ps1');
+      expect(cmd).toBe(
+        'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:/Users/Doug Warren/.agentdeck/claude-hook.ps1" SessionStart',
+      );
     });
 
-    it('uses single-line PowerShell so cmd.exe can pass it as one -Command argument', () => {
+    it('contains no `$` — Claude Code executes hooks through git-bash, which $-expands inline PowerShell to garbage', () => {
+      for (const event of HOOK_EVENTS) {
+        const cmd = buildHookCommandWin(event);
+        expect(cmd).not.toContain('$');
+        expect(cmd).not.toContain('-Command');
+        expect(cmd).not.toContain('\n');
+        expect(/^[\x00-\x7F]*$/.test(cmd)).toBe(true);
+      }
+    });
+
+    it('embeds the path with forward slashes and double quotes (bash/cmd/PowerShell-safe)', () => {
       const cmd = buildHookCommandWin('Stop');
-      expect(cmd).not.toContain('\n');
+      expect(cmd).not.toContain('\\');
+      expect(cmd).toMatch(/-File "[^"]+\/claude-hook\.ps1" Stop$/);
     });
+  });
 
-    it('omits the macOS App Store sandbox-container fallback paths', () => {
-      const cmd = buildHookCommandWin('SessionStart');
-      expect(cmd).not.toContain('Library/Containers/bound.serendipity');
-      expect(cmd).not.toContain('group.bound.serendipity');
+  describe('claudeHookScriptContent (Windows sidecar)', () => {
+    const script = claudeHookScriptContent();
+
+    it('resolves the port via AGENTDECK_PORT, then daemon.json + /health probe, then 9120', () => {
+      expect(script).toContain('param([string]$EventName)');
+      expect(script).toContain('$env:AGENTDECK_PORT');
+      expect(script).toContain(".agentdeck\\daemon.json");
+      expect(script).toContain('/health');
+      expect(script).toContain("$port = '9120'");
+      // No macOS App Store sandbox-container paths on Windows.
+      expect(script).not.toContain('Library/Containers/bound.serendipity');
+      expect(script).not.toContain('group.bound.serendipity');
     });
 
     it('reads stdin as UTF-8 and posts UTF-8 bytes with charset (#46)', () => {
-      const cmd = buildHookCommandWin('SessionStart');
-      // Read stdin through a UTF-8 StreamReader — [Console]::In decodes piped
-      // stdin with the OEM codepage (e.g. CP949) and garbles non-ASCII payloads.
-      expect(cmd).toContain('StreamReader([Console]::OpenStandardInput()');
-      expect(cmd).toContain('[System.Text.Encoding]::UTF8');
-      expect(cmd).not.toContain('[Console]::In.ReadToEnd()');
-      // POST UTF-8 bytes with a charset — Invoke-RestMethod encodes a string body
-      // as ISO-8859-1 when the content type carries no charset, mangling non-ASCII.
-      expect(cmd).toContain('[System.Text.Encoding]::UTF8.GetBytes');
-      expect(cmd).toContain('application/json; charset=utf-8');
-      // Still a single -Command line (cmd.exe passes it as one arg) and ASCII-only
-      // (the non-ASCII payload arrives at runtime via stdin, never embedded here).
-      expect(cmd).not.toContain('\n');
-      expect(/^[\x00-\x7F]*$/.test(cmd)).toBe(true);
+      expect(script).toContain('StreamReader([Console]::OpenStandardInput()');
+      expect(script).toContain('[System.Text.Encoding]::UTF8');
+      expect(script).not.toContain('[Console]::In.ReadToEnd()');
+      expect(script).toContain('[System.Text.Encoding]::UTF8.GetBytes');
+      expect(script).toContain('application/json; charset=utf-8');
+    });
+
+    it('handles PreToolUse/Stop as request-response with raw BOM-less stdout echo', () => {
+      // Timeouts mirror POSIX: PreToolUse 60s (device-approval hold), Stop 10s
+      // (runs on every turn end — must never stall the TUI).
+      expect(script).toContain("if ($EventName -eq 'PreToolUse') { 60 } else { 10 }");
+      // Raw bytes out of RawContentStream — Invoke-RestMethod would deserialize
+      // the JSON reply and corrupt the stdout contract.
+      expect(script).toContain('Invoke-WebRequest -UseBasicParsing -Method Post');
+      expect(script).toContain('RawContentStream.ToArray()');
+      // BOM-less UTF-8 writer — a BOM before the JSON breaks Claude's parser.
+      expect(script).toContain('System.Text.UTF8Encoding($false)');
+      // Fire-and-forget for everything else, short timeout.
+      expect(script).toContain('Invoke-RestMethod -Method Post -TimeoutSec 2');
+    });
+
+    it('is ASCII-only, LF-separated, silently-erroring, and ends with exit 0', () => {
+      expect(/^[\x00-\x7F]*$/.test(script)).toBe(true);
+      expect(script).not.toContain('\r');
+      expect(script).toContain("$ErrorActionPreference = 'SilentlyContinue'");
+      expect(script.trimEnd().endsWith('exit 0')).toBe(true);
+      expect(script.endsWith('\n')).toBe(true);
+    });
+  });
+
+  describe('isAgentDeckHookCommand', () => {
+    it('recognises every AgentDeck command generation', () => {
+      expect(isAgentDeckHookCommand(buildHookCommand('SessionStart'))).toBe(true);
+      expect(isAgentDeckHookCommand(buildHookCommandWin('SessionStart'))).toBe(true);
+      // Legacy hardcoded-port generation.
+      expect(isAgentDeckHookCommand('curl -sf http://localhost:9120/hooks/Stop')).toBe(true);
+      // Pre-sidecar Windows inline one-liner.
+      expect(isAgentDeckHookCommand('powershell -NoProfile -Command "$port=$env:AGENTDECK_PORT; ..."')).toBe(true);
+    });
+
+    it('rejects user hooks and non-strings', () => {
+      expect(isAgentDeckHookCommand('echo "custom hook"')).toBe(false);
+      expect(isAgentDeckHookCommand('powershell -File "C:/my/own-hook.ps1"')).toBe(false);
+      expect(isAgentDeckHookCommand(undefined)).toBe(false);
+      expect(isAgentDeckHookCommand(42)).toBe(false);
     });
   });
 
   describe('applyHooks', () => {
     it('installs hooks to empty settings in matcher-group format', () => {
-      const result = applyHooks({});
+      const result = applyHooks({}, { platform: 'linux' });
       expect(result.hooks).toBeDefined();
       expect(Object.keys(result.hooks)).toHaveLength(HOOK_EVENTS.length);
 
@@ -110,6 +168,16 @@ describe('Hook Installer', () => {
         expect(group.hooks).toHaveLength(1);
         expect(group.hooks[0].command).toContain('AGENTDECK_PORT');
         expect(group.hooks[0].command).toContain(event);
+      }
+    });
+
+    it('installs sidecar-pointer hooks on win32', () => {
+      const result = applyHooks({}, { platform: 'win32' });
+      for (const event of HOOK_EVENTS) {
+        expect(result.hooks[event]).toHaveLength(1);
+        const cmd = result.hooks[event][0].hooks[0].command;
+        expect(cmd).toContain('claude-hook.ps1');
+        expect(cmd.endsWith(` ${event}`)).toBe(true);
       }
     });
 
@@ -137,7 +205,7 @@ describe('Hook Installer', () => {
           ],
         },
       };
-      const result = applyHooks(settings);
+      const result = applyHooks(settings, { platform: 'linux' });
       expect(result.hooks.SessionStart).toHaveLength(1);
       expect(result.hooks.SessionStart[0].hooks[0].command).toContain('AGENTDECK_PORT');
     });
@@ -153,7 +221,7 @@ describe('Hook Installer', () => {
           ],
         },
       };
-      const result = applyHooks(settings);
+      const result = applyHooks(settings, { platform: 'linux' });
       expect(result.hooks.SessionStart).toHaveLength(1);
       expect(result.hooks.SessionStart[0].hooks[0].command).toContain('AGENTDECK_PORT');
     });
@@ -165,6 +233,36 @@ describe('Hook Installer', () => {
       for (const event of HOOK_EVENTS) {
         expect(second.hooks[event]).toHaveLength(1);
       }
+    });
+
+    it('is idempotent on win32 — the sidecar command is recognised as AgentDeck-owned', () => {
+      // Regression guard for the predicate: the `-File` command contains no
+      // `AGENTDECK_PORT` text, so recognition rides on the script filename.
+      const first = applyHooks({}, { platform: 'win32' });
+      const second = applyHooks(JSON.parse(JSON.stringify(first)), { platform: 'win32' });
+
+      for (const event of HOOK_EVENTS) {
+        expect(second.hooks[event]).toHaveLength(1);
+      }
+    });
+
+    it('replaces the pre-sidecar Windows inline one-liner (win32 → win32 upgrade)', () => {
+      const settings = {
+        hooks: {
+          SessionStart: [
+            {
+              matcher: '',
+              hooks: [{
+                type: 'command',
+                command: 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$ev=\'SessionStart\'; $port=$env:AGENTDECK_PORT; ..."',
+              }],
+            },
+          ],
+        },
+      };
+      const result = applyHooks(settings, { platform: 'win32' });
+      expect(result.hooks.SessionStart).toHaveLength(1);
+      expect(result.hooks.SessionStart[0].hooks[0].command).toContain('claude-hook.ps1');
     });
 
     it('preserves existing non-hook settings', () => {
@@ -350,10 +448,109 @@ describe('steering hook channels (request-response)', () => {
     // Same predicate migrateHooksIfNeeded uses to decide on a rewrite.
     expect(raw.includes('/hooks/Stop') && !/RESP=\$\(curl[^\n]*\/hooks\/Stop/.test(raw)).toBe(true);
 
-    applyHooks(settings);
+    applyHooks(settings, { platform: 'linux' });
     const stopCmd = (settings.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)
       .flatMap((h) => h.hooks).map((h) => h.command).join('\n');
     expect(stopCmd).toContain('RESP=$(curl');
     expect(stopCmd).toContain('/hooks/Stop');
+  });
+});
+
+describe('file-based install/uninstall/migrate (win32 sidecar)', () => {
+  let dir: string;
+
+  function tmp(): { claudeDir: string; scriptPath: string; settingsPath: string } {
+    dir = mkdtempSync(join(tmpdir(), 'agentdeck-hooks-test-'));
+    const claudeDir = join(dir, '.claude');
+    mkdirSync(claudeDir, { recursive: true });
+    return {
+      claudeDir,
+      scriptPath: join(dir, '.agentdeck', 'claude-hook.ps1'),
+      settingsPath: join(claudeDir, 'settings.local.json'),
+    };
+  }
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('installHooks writes the sidecar before referencing it and installs -File hooks', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    installHooks({ claudeDir, scriptPath, platform: 'win32' });
+
+    expect(existsSync(scriptPath)).toBe(true);
+    expect(readFileSync(scriptPath, 'utf-8')).toBe(claudeHookScriptContent());
+
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    for (const event of HOOK_EVENTS) {
+      const cmd = settings.hooks[event][0].hooks[0].command;
+      expect(cmd).toContain(scriptPath.replace(/\\/g, '/'));
+      expect(cmd).not.toContain('$');
+    }
+  });
+
+  it('installHooks skips the sidecar on POSIX', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    installHooks({ claudeDir, scriptPath, platform: 'linux' });
+
+    expect(existsSync(scriptPath)).toBe(false);
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(settings.hooks.SessionStart[0].hooks[0].command).toContain('AGENTDECK_PORT');
+  });
+
+  it('uninstallHooks removes the hooks and deletes the sidecar, preserving user content', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    writeFileSync(settingsPath, JSON.stringify({ permissions: { allow: ['Bash(ls *)'] } }, null, 2));
+    installHooks({ claudeDir, scriptPath, platform: 'win32' });
+
+    uninstallHooks({ claudeDir, scriptPath, platform: 'win32' });
+
+    expect(existsSync(scriptPath)).toBe(false);
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(settings.hooks).toBeUndefined();
+    expect(settings.permissions).toEqual({ allow: ['Bash(ls *)'] });
+  });
+
+  it('Migration 6: migrateHooksIfNeeded rewrites the bash-hostile inline one-liner to -File form', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    const legacyWinCommand =
+      'powershell -NoProfile -ExecutionPolicy Bypass -Command "$ev=\'Stop\'; $port=$env:AGENTDECK_PORT; ' +
+      'if(-not $port){$f=Join-Path $env:USERPROFILE \'.agentdeck\\daemon.json\'; ...}; ' +
+      'try{Invoke-RestMethod -Uri (\'http://127.0.0.1:\'+$port+\'/hooks/\'+$ev) ...}catch{}"';
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: { Stop: [{ matcher: '', hooks: [{ type: 'command', command: legacyWinCommand }] }] },
+    }, null, 2));
+
+    migrateHooksIfNeeded({ claudeDir, scriptPath, platform: 'win32' });
+
+    expect(existsSync(scriptPath)).toBe(true);
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const stopCmd = settings.hooks.Stop[0].hooks[0].command;
+    expect(stopCmd).toContain('claude-hook.ps1');
+    expect(stopCmd).not.toContain('$');
+  });
+
+  it('migrateHooksIfNeeded refreshes stale sidecar content and no-ops on current files', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    installHooks({ claudeDir, scriptPath, platform: 'win32' });
+    const installed = readFileSync(settingsPath, 'utf-8');
+    writeFileSync(scriptPath, '# stale old script\n');
+
+    migrateHooksIfNeeded({ claudeDir, scriptPath, platform: 'win32' });
+
+    // Sidecar refreshed to current content; settings byte-identical (no churn).
+    expect(readFileSync(scriptPath, 'utf-8')).toBe(claudeHookScriptContent());
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(installed);
+  });
+
+  it('migrateHooksIfNeeded leaves non-AgentDeck settings files untouched', () => {
+    const { claudeDir, scriptPath, settingsPath } = tmp();
+    const original = JSON.stringify({ hooks: { Stop: [{ matcher: '', hooks: [{ type: 'command', command: 'echo mine' }] }] } }, null, 2);
+    writeFileSync(settingsPath, original);
+
+    migrateHooksIfNeeded({ claudeDir, scriptPath, platform: 'win32' });
+
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(original);
+    expect(existsSync(scriptPath)).toBe(false);
   });
 });

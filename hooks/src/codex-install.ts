@@ -301,10 +301,11 @@ function readText(path: string): string {
   }
 }
 
-/** Write the notify sidecar only when its content changed, so repeated
+/** Write a sidecar script only when its content changed, so repeated
  *  installs stay idempotent (no mtime churn). Returns false when the
- *  script cannot be guaranteed on disk. */
-function writeScriptIfChanged(content: string, path: string): boolean {
+ *  script cannot be guaranteed on disk. Shared with the Claude hook
+ *  installer (`install.ts` — `claude-hook.ps1`). */
+export function writeScriptIfChanged(content: string, path: string): boolean {
   try {
     if (existsSync(path) && readFileSync(path, 'utf-8') === content) return true;
   } catch { /* unreadable — fall through to rewrite */ }

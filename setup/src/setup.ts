@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'fs';
+import { dirname, join } from 'path';
 import { homedir } from 'os';
 
 // ─── Colors ──────────────────────────────────────────────────────────
@@ -185,11 +185,12 @@ const HOOK_EVENTS = [
 ] as const;
 
 /**
- * Kept byte-identical with `@agentdeck/hooks` `buildHookCommand` and the
- * Swift `HookInstaller.buildHookEntry` snippet. Any change here MUST be
- * mirrored in those two places, otherwise users installing via different
- * paths end up with inconsistent daemon discovery. See `hooks/src/install.ts`
- * for the canonical commentary.
+ * Kept byte-identical with `@agentdeck/hooks` `buildHookCommand`
+ * (hooks/src/install.ts — canonical commentary lives there) and the Swift
+ * `HookInstaller.buildHookEntry` snippet. Any change here MUST be mirrored
+ * in those two places, otherwise users installing via different paths end
+ * up with inconsistent daemon discovery. The same triple-sync rule applies
+ * to `claudeHookScriptContent` / `buildHookCommandWin` below.
  */
 function buildHookCommand(eventName: string): string {
   const preamble = [
@@ -223,22 +224,92 @@ function buildHookCommand(eventName: string): string {
   ]).join('\n');
 }
 
-/** Windows variant — kept in sync with `@agentdeck/hooks` `buildHookCommandWin`. */
+/** Windows sidecar script path — kept in sync with `@agentdeck/hooks`
+ *  `DEFAULT_CLAUDE_HOOK_SCRIPT_PATH`. */
+const CLAUDE_HOOK_SCRIPT_PATH = join(homedir(), '.agentdeck', 'claude-hook.ps1');
+
+/** Windows sidecar body — kept byte-identical with `@agentdeck/hooks`
+ *  `claudeHookScriptContent` (canonical commentary in hooks/src/install.ts).
+ *  The hook command in settings must contain no `$` (Claude Code executes
+ *  hooks through git-bash on Windows, which $-expands inline PowerShell to
+ *  garbage), so all logic lives in this on-disk script. */
+function claudeHookScriptContent(): string {
+  return [
+    `# AgentDeck Claude Code hook sidecar - managed by @agentdeck/hooks, do not edit.`,
+    `# Invoked as: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <this> <EventName>`,
+    `param([string]$EventName)`,
+    `$ErrorActionPreference = 'SilentlyContinue'`,
+    `$ProgressPreference = 'SilentlyContinue'`,
+    `$port = $env:AGENTDECK_PORT`,
+    `if ([string]::IsNullOrWhiteSpace($port)) {`,
+    `  $daemonFile = Join-Path $env:USERPROFILE '.agentdeck\\daemon.json'`,
+    `  if (Test-Path -LiteralPath $daemonFile) {`,
+    `    try {`,
+    `      $daemon = Get-Content -LiteralPath $daemonFile -Raw | ConvertFrom-Json`,
+    `      $candidate = if ($daemon.httpPort) { $daemon.httpPort } else { $daemon.port }`,
+    `      if ($candidate) {`,
+    `        try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 -Uri ('http://127.0.0.1:' + $candidate + '/health') | Out-Null; $port = [string]$candidate } catch {}`,
+    `      }`,
+    `    } catch {}`,
+    `  }`,
+    `}`,
+    `if ([string]::IsNullOrWhiteSpace($port)) { $port = '9120' }`,
+    `# Read stdin as UTF-8: [Console]::In decodes piped stdin with the console OEM`,
+    `# codepage (e.g. CP949), garbling non-ASCII payload text.`,
+    `$body = (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8)).ReadToEnd()`,
+    `# Post UTF-8 bytes: a string body is encoded as ISO-8859-1 when the content`,
+    `# type carries no charset, replacing non-ASCII characters with '?'.`,
+    `$bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$body)`,
+    `$uri = 'http://127.0.0.1:' + $port + '/hooks/' + $EventName`,
+    `if ($EventName -eq 'PreToolUse' -or $EventName -eq 'Stop') {`,
+    `  # Request-response: echo the daemon's raw reply to stdout so Claude can gate`,
+    `  # the tool (PreToolUse device approval) or continue with a turn-end directive`,
+    `  # (Stop). PreToolUse waits out the daemon's approval hold; Stop runs on EVERY`,
+    `  # turn end, so its timeout is short. Empty output = Claude's normal flow.`,
+    `  $timeout = if ($EventName -eq 'PreToolUse') { 60 } else { 10 }`,
+    `  try {`,
+    `    $resp = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec $timeout -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes`,
+    `    if ($resp -and $resp.RawContentStream) {`,
+    `      $text = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())`,
+    `      if ($text.Length -gt 0) {`,
+    `        $out = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), (New-Object System.Text.UTF8Encoding($false)))`,
+    `        $out.Write($text)`,
+    `        $out.Flush()`,
+    `      }`,
+    `    }`,
+    `  } catch {}`,
+    `} else {`,
+    `  try { Invoke-RestMethod -Method Post -TimeoutSec 2 -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes | Out-Null } catch {}`,
+    `}`,
+    `exit 0`,
+  ].join('\n') + '\n';
+}
+
+/** Minimal copy of `@agentdeck/hooks` `writeScriptIfChanged` (atomic
+ *  temp+rename, no-op when content is unchanged). */
+function writeScriptIfChanged(content: string, path: string): boolean {
+  try {
+    if (existsSync(path) && readFileSync(path, 'utf-8') === content) return true;
+  } catch { /* unreadable — fall through to rewrite */ }
+  const dir = dirname(path);
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const tmp = `${path}.agentdeck.tmp`;
+    writeFileSync(tmp, content, 'utf-8');
+    renameSync(tmp, path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Windows variant — kept in sync with `@agentdeck/hooks` `buildHookCommandWin`.
+ *  A bare `-File` pointer with the event name as positional argument: no `$`
+ *  on the command line (git-bash safe), forward-slash path (PowerShell accepts
+ *  it), double-quoted for user names with spaces. */
 function buildHookCommandWin(eventName: string): string {
-  const ps = [
-    `$ev='${eventName}'`,
-    `$port=$env:AGENTDECK_PORT`,
-    `if(-not $port){$f=Join-Path $env:USERPROFILE '.agentdeck\\daemon.json'; if(Test-Path $f){try{$d=Get-Content -Raw $f|ConvertFrom-Json; $p=if($d.httpPort){$d.httpPort}else{$d.port}; if($p){try{Invoke-RestMethod -Uri ('http://127.0.0.1:'+$p+'/health') -TimeoutSec 1 -ErrorAction Stop|Out-Null; $port=$p}catch{}}}catch{}}}`,
-    `if(-not $port){$port=9120}`,
-    // Read stdin as UTF-8: [Console]::In decodes piped stdin with the console OEM
-    // codepage (e.g. CP949), garbling non-ASCII payload text.
-    `$body=(New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::UTF8)).ReadToEnd()`,
-    // Post UTF-8 bytes: Invoke-RestMethod encodes a string body as ISO-8859-1 when
-    // the content type carries no charset, replacing non-ASCII characters with '?'.
-    `$bytes=[System.Text.Encoding]::UTF8.GetBytes([string]$body)`,
-    `try{Invoke-RestMethod -Uri ('http://127.0.0.1:'+$port+'/hooks/'+$ev) -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 2 -ErrorAction Stop|Out-Null}catch{}`,
-  ].join('; ');
-  return `powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`;
+  const shellSafePath = CLAUDE_HOOK_SCRIPT_PATH.replace(/\\/g, '/');
+  return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${shellSafePath}" ${eventName}`;
 }
 
 function buildHookEntry(eventName: string) {
@@ -263,6 +334,13 @@ function installHooks() {
 
   info('Installing Claude Code hooks...');
 
+  // The Windows hook command is just a `-File` pointer — the sidecar must be
+  // on disk before the settings reference it.
+  if (IS_WIN && !writeScriptIfChanged(claudeHookScriptContent(), CLAUDE_HOOK_SCRIPT_PATH)) {
+    fail(`Could not write hook sidecar script: ${CLAUDE_HOOK_SCRIPT_PATH}`);
+    return;
+  }
+
   const claudeDir = join(homedir(), '.claude');
   const settingsPath = join(claudeDir, 'settings.local.json');
 
@@ -285,18 +363,16 @@ function installHooks() {
       settings.hooks[event] = [];
     }
 
-    // Remove existing AgentDeck hooks (old flat + new matcher format)
+    // Remove existing AgentDeck hooks (old flat + matcher format + the
+    // Windows `-File` sidecar form, whose marker is the script filename)
+    const isAgentDeckCommand = (cmd: unknown) =>
+      typeof cmd === 'string' &&
+      (cmd.includes('AGENTDECK_PORT') || cmd.includes('localhost:9120') || cmd.includes('claude-hook.ps1'));
     settings.hooks[event] = settings.hooks[event].filter((h: any) => {
-      if (h.command?.includes('AGENTDECK_PORT') || h.command?.includes('localhost:9120')) {
+      if (isAgentDeckCommand(h.command)) {
         return false;
       }
-      if (
-        Array.isArray(h.hooks) &&
-        h.hooks.some(
-          (hh: any) =>
-            hh.command?.includes('AGENTDECK_PORT') || hh.command?.includes('localhost:9120'),
-        )
-      ) {
+      if (Array.isArray(h.hooks) && h.hooks.some((hh: any) => isAgentDeckCommand(hh.command))) {
         return false;
       }
       return true;
