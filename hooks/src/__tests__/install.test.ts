@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import {
   HOOK_EVENTS,
   buildHookCommand,
@@ -7,6 +10,9 @@ import {
   applyHooks,
   removeHooks,
   migrateHooks,
+  installHooks,
+  uninstallHooks,
+  migrateHooksIfNeeded,
 } from '../install.js';
 
 describe('Hook Installer', () => {
@@ -351,9 +357,146 @@ describe('steering hook channels (request-response)', () => {
     expect(raw.includes('/hooks/Stop') && !/RESP=\$\(curl[^\n]*\/hooks\/Stop/.test(raw)).toBe(true);
 
     applyHooks(settings);
-    const stopCmd = (settings.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)
-      .flatMap((h) => h.hooks).map((h) => h.command).join('\n');
-    expect(stopCmd).toContain('RESP=$(curl');
-    expect(stopCmd).toContain('/hooks/Stop');
+    const stopCmds = (settings.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)
+      .flatMap((h) => h.hooks).map((h) => h.command);
+    // The legacy hook is replaced by the current-generation command for the
+    // host platform (applyHooks picks the variant via process.platform)...
+    const expected = process.platform === 'win32' ? buildHookCommandWin('Stop') : buildHookCommand('Stop');
+    expect(stopCmds).toContain(expected);
+    // ...and the POSIX form the migration exists to produce is request-response.
+    const posixStop = buildHookCommand('Stop');
+    expect(posixStop).toContain('RESP=$(curl');
+    expect(posixStop).toContain('/hooks/Stop');
+  });
+});
+
+describe('file-based install/uninstall/migrate (settings.json target)', () => {
+  let dir: string;
+
+  function tmp(): { claudeDir: string; settingsPath: string; legacyPath: string } {
+    dir = mkdtempSync(join(tmpdir(), 'agentdeck-hooks-test-'));
+    const claudeDir = join(dir, '.claude');
+    mkdirSync(claudeDir, { recursive: true });
+    return {
+      claudeDir,
+      settingsPath: join(claudeDir, 'settings.json'),
+      legacyPath: join(claudeDir, 'settings.local.json'),
+    };
+  }
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('installHooks writes the user-global settings.json, preserving user keys', () => {
+    const { claudeDir, settingsPath } = tmp();
+    writeFileSync(settingsPath, JSON.stringify({ model: 'opus', statusLine: { type: 'command' } }, null, 2));
+
+    installHooks({ claudeDir });
+
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(settings.model).toBe('opus');
+    expect(settings.statusLine).toEqual({ type: 'command' });
+    for (const event of HOOK_EVENTS) {
+      expect(settings.hooks[event]).toHaveLength(1);
+    }
+  });
+
+  it('installHooks scrubs AgentDeck hooks out of the legacy settings.local.json, keeping user content', () => {
+    const { claudeDir, legacyPath } = tmp();
+    const legacy = applyHooks({ permissions: { allow: ['Bash(ls *)'] } });
+    legacy.hooks.SessionStart.unshift({ matcher: 'custom', hooks: [{ type: 'command', command: 'echo keep' }] });
+    writeFileSync(legacyPath, JSON.stringify(legacy, null, 2));
+
+    installHooks({ claudeDir });
+
+    const scrubbed = JSON.parse(readFileSync(legacyPath, 'utf-8'));
+    expect(scrubbed.permissions).toEqual({ allow: ['Bash(ls *)'] });
+    expect(scrubbed.hooks.SessionStart).toHaveLength(1);
+    expect(scrubbed.hooks.SessionStart[0].hooks[0].command).toBe('echo keep');
+    expect(scrubbed.hooks.Stop).toBeUndefined();
+  });
+
+  it('installHooks throws on a corrupt settings.json instead of clobbering it', () => {
+    const { claudeDir, settingsPath } = tmp();
+    writeFileSync(settingsPath, '{ not valid json');
+
+    expect(() => installHooks({ claudeDir })).toThrow();
+    expect(readFileSync(settingsPath, 'utf-8')).toBe('{ not valid json');
+  });
+
+  it('uninstallHooks cleans both settings.json and the legacy file', () => {
+    const { claudeDir, settingsPath, legacyPath } = tmp();
+    writeFileSync(legacyPath, JSON.stringify(applyHooks({ permissions: { allow: [] } }), null, 2));
+    installHooks({ claudeDir });
+
+    uninstallHooks({ claudeDir });
+
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(settings.hooks).toBeUndefined();
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf-8'));
+    expect(legacy.hooks).toBeUndefined();
+    expect(legacy.permissions).toEqual({ allow: [] });
+  });
+
+  it('migrateHooksIfNeeded moves stranded hooks local→global', () => {
+    const { claudeDir, settingsPath, legacyPath } = tmp();
+    writeFileSync(legacyPath, JSON.stringify(applyHooks({}), null, 2));
+    expect(existsSync(settingsPath)).toBe(false);
+
+    migrateHooksIfNeeded({ claudeDir });
+
+    const legacy = JSON.parse(readFileSync(legacyPath, 'utf-8'));
+    expect(legacy.hooks).toBeUndefined();
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    for (const event of HOOK_EVENTS) {
+      expect(settings.hooks[event]).toHaveLength(1);
+    }
+  });
+
+  it('migrateHooksIfNeeded dedups when the global file already carries hooks (App Store + CLI dual install)', () => {
+    const { claudeDir, settingsPath, legacyPath } = tmp();
+    writeFileSync(settingsPath, JSON.stringify(applyHooks({ model: 'opus' }), null, 2));
+    writeFileSync(legacyPath, JSON.stringify(applyHooks({}), null, 2));
+
+    migrateHooksIfNeeded({ claudeDir });
+
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(settings.model).toBe('opus');
+    for (const event of HOOK_EVENTS) {
+      expect(settings.hooks[event]).toHaveLength(1);
+    }
+  });
+
+  it('migrateHooksIfNeeded no-ops when nothing is AgentDeck-owned', () => {
+    const { claudeDir, settingsPath, legacyPath } = tmp();
+    const settingsOriginal = JSON.stringify({ model: 'opus' }, null, 2) + '\n';
+    const legacyOriginal = JSON.stringify({ permissions: { allow: ['Bash(ls *)'] } }, null, 2) + '\n';
+    writeFileSync(settingsPath, settingsOriginal);
+    writeFileSync(legacyPath, legacyOriginal);
+
+    migrateHooksIfNeeded({ claudeDir });
+
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(settingsOriginal);
+    expect(readFileSync(legacyPath, 'utf-8')).toBe(legacyOriginal);
+  });
+
+  it('migrateHooksIfNeeded still applies format upgrades against settings.json', () => {
+    const { claudeDir, settingsPath } = tmp();
+    // Legacy flat-format hook with hardcoded port, now living in the global file.
+    writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{ type: 'command', command: 'curl -sf -X POST http://localhost:9120/hooks/SessionStart -d @-' }],
+      },
+    }, null, 2));
+
+    migrateHooksIfNeeded({ claudeDir });
+
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    // Migration 1 (hardcoded port → env var) + Migration 2 (flat → matcher-group).
+    const group = settings.hooks.SessionStart[0];
+    expect(group.hooks).toHaveLength(1);
+    expect(group.hooks[0].command).toContain('AGENTDECK_PORT');
+    expect(group.hooks[0].command).not.toContain('localhost:9120');
   });
 });

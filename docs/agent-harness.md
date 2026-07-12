@@ -20,7 +20,7 @@ This repo is built by switching between **Claude Code, Codex, OpenCode, and occa
 | **Antigravity** | manual editing, or native Antigravity CLI/app | `AGENTS.md` → `CLAUDE.md` | Instruction files only; no repo hook/skill auto-discovery | Current product session visibility is CLI-daemon passive discovery only; the App Store app shows usage/credit status, not coding-session observation |
 
 Notes:
-- **Claude Code & Codex** are the two first-class authoring agents: both get lifecycle hooks (Claude CLI installer: `~/.claude/settings.local.json`; App Store opt-in installer: user-selected `~/.claude/settings.json`; Codex: `~/.codex/config.toml`) and discover skills.
+- **Claude Code & Codex** are the two first-class authoring agents: both get lifecycle hooks (Claude CLI installer and App Store opt-in installer both target the user-global `~/.claude/settings.json`; Codex: `~/.codex/config.toml`) and discover skills.
 - **OpenCode** is a fully supported *product session type* through `agentdeck opencode` (PTY + SSE overlay), but it does not auto-discover this repo's skills or hooks as an authoring tool. Explicit workflow paths are the supported handoff.
 - **Antigravity** reads the repo instruction chain only. AgentDeck does not install or auto-discover Antigravity hooks/skills; the App Store app reads only the user-approved usage/credit database, while coding-session creatures require optional CLI-daemon passive discovery.
 

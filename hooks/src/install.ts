@@ -239,10 +239,51 @@ export function migrateHooks(settings: any): { settings: any; migrated: boolean 
   return { settings, migrated };
 }
 
-/** File-system wrapper: install hooks into ~/.claude/settings.local.json */
-export function installHooks(): void {
-  const claudeDir = join(homedir(), '.claude');
-  const settingsPath = join(claudeDir, 'settings.local.json');
+/** True when a settings file's raw text contains any AgentDeck hook marker
+ *  (any generation: POSIX preamble, legacy hardcoded port, or the Windows
+ *  `claude-hook.ps1` sidecar pointer). */
+function hasAgentDeckMarkers(raw: string): boolean {
+  return (
+    raw.includes('AGENTDECK_PORT') ||
+    raw.includes('localhost:9120') ||
+    raw.includes('claude-hook.ps1')
+  );
+}
+
+/** Options for the file-system entry points (overridable for tests). */
+export interface HookFileOptions {
+  /** Override the `.claude` directory (tests + non-default homes). */
+  claudeDir?: string;
+}
+
+/** Remove AgentDeck hooks from the legacy `~/.claude/settings.local.json`.
+ *  Earlier installers wrote there, but Claude Code has no user-level
+ *  settings.local.json scope — the file is only read as *project-local*
+ *  settings when the session cwd IS the home directory, so hooks installed
+ *  there never fired in real projects. The file itself is never deleted:
+ *  it can hold user permission rules for home-directory sessions. */
+function scrubLegacyLocalSettings(claudeDir: string): void {
+  try {
+    const legacyPath = join(claudeDir, 'settings.local.json');
+    if (!existsSync(legacyPath)) return;
+    const raw = readFileSync(legacyPath, 'utf-8');
+    if (!hasAgentDeckMarkers(raw)) return;
+    const settings = JSON.parse(raw);
+    removeHooks(settings);
+    writeFileSync(legacyPath, JSON.stringify(settings, null, 2) + '\n');
+  } catch {
+    // Best effort — a malformed legacy file must not block install/migration.
+  }
+}
+
+/** File-system wrapper: install hooks into the user-global
+ *  ~/.claude/settings.json — the only user-scope settings file Claude Code
+ *  reads in every project (and the same file the App Store opt-in installer
+ *  targets). Read-modify-write only; a JSON parse failure throws so a
+ *  hand-edited file is never clobbered. */
+export function installHooks(opts: HookFileOptions = {}): void {
+  const claudeDir = opts.claudeDir ?? join(homedir(), '.claude');
+  const settingsPath = join(claudeDir, 'settings.json');
 
   if (!existsSync(claudeDir)) {
     mkdirSync(claudeDir, { recursive: true });
@@ -257,33 +298,64 @@ export function installHooks(): void {
   applyHooks(settings);
 
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  scrubLegacyLocalSettings(claudeDir);
   console.log(`Hooks installed to ${settingsPath}`);
 }
 
-/** File-system wrapper: uninstall hooks from ~/.claude/settings.local.json */
-export function uninstallHooks(): void {
-  const settingsPath = join(homedir(), '.claude', 'settings.local.json');
-  if (!existsSync(settingsPath)) return;
+/** File-system wrapper: uninstall hooks from ~/.claude/settings.json and
+ *  from the legacy ~/.claude/settings.local.json (pre-move installs). */
+export function uninstallHooks(opts: HookFileOptions = {}): void {
+  const claudeDir = opts.claudeDir ?? join(homedir(), '.claude');
+  const settingsPath = join(claudeDir, 'settings.json');
 
-  const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-  removeHooks(settings);
+  if (existsSync(settingsPath)) {
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    removeHooks(settings);
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  }
 
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  scrubLegacyLocalSettings(claudeDir);
   console.log('Hooks uninstalled');
 }
 
-/** File-system wrapper: migrate old hook formats in ~/.claude/settings.local.json.
- *  Silently catches errors to avoid breaking session startup. */
-export function migrateHooksIfNeeded(): void {
+/** File-system wrapper: migrate old hook installs. Runs on every
+ *  `agentdeck claude` session start; silently catches errors to avoid
+ *  breaking startup.
+ *
+ *  Two jobs:
+ *   - **local→global move**: hooks found in the legacy settings.local.json
+ *     are removed there and (re)installed into settings.json, where Claude
+ *     Code actually reads them in every project.
+ *   - Migrations 1–5 (format/port/request-response upgrades) now run
+ *     against settings.json. */
+export function migrateHooksIfNeeded(opts: HookFileOptions = {}): void {
   try {
-    const settingsPath = join(homedir(), '.claude', 'settings.local.json');
-    if (!existsSync(settingsPath)) return;
+    const claudeDir = opts.claudeDir ?? join(homedir(), '.claude');
+    const settingsPath = join(claudeDir, 'settings.json');
+    const legacyPath = join(claudeDir, 'settings.local.json');
 
-    const raw = readFileSync(settingsPath, 'utf-8');
-    if (!raw.includes('AGENTDECK_PORT') && !raw.includes('localhost:9120')) return;
+    // Local→global move: detect AgentDeck hooks stranded in the legacy file.
+    let movedFromLegacy = false;
+    if (existsSync(legacyPath) && hasAgentDeckMarkers(readFileSync(legacyPath, 'utf-8'))) {
+      scrubLegacyLocalSettings(claudeDir);
+      movedFromLegacy = true;
+    }
+
+    if (!existsSync(settingsPath) && !movedFromLegacy) return;
+
+    const raw = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf-8') : '{}';
+    if (!movedFromLegacy && !hasAgentDeckMarkers(raw)) return;
 
     const settings = JSON.parse(raw);
     let { migrated } = migrateHooks(settings);
+
+    // Complete the local→global move: (re)apply the current hooks to the
+    // global file. applyHooks dedups, so a file that already carries them
+    // (e.g. installed by the App Store opt-in) ends up with exactly one copy.
+    if (movedFromLegacy) {
+      applyHooks(settings);
+      migrated = true;
+    }
 
     // Migration 4: upgrade hooks using simple :-9120 fallback to daemon.json-reading format.
     // This handles existing users from before daemon.json runtime lookup was added.

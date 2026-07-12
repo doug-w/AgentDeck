@@ -236,7 +236,7 @@ AgentDeck/
 │   └── rollup.config.mjs        # Bundle config
 │
 ├── hooks/                        # Claude Code hook installer
-│   └── src/install.ts            # Register/unregister hooks in settings.local.json
+│   └── src/install.ts            # Register/unregister hooks in ~/.claude/settings.json
 │
 ├── setup/                        # npm setup package (@agentdeck/setup)
 │   └── src/setup.ts              # npx @agentdeck/setup entry point

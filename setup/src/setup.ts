@@ -263,8 +263,12 @@ function installHooks() {
 
   info('Installing Claude Code hooks...');
 
+  // User-global settings.json — the only user-scope settings file Claude Code
+  // reads in every project (same file the App Store opt-in installer targets).
+  // settings.local.json is NOT a user-level file: it is only read as
+  // project-local settings when the session cwd IS the home directory.
   const claudeDir = join(homedir(), '.claude');
-  const settingsPath = join(claudeDir, 'settings.local.json');
+  const settingsPath = join(claudeDir, 'settings.json');
 
   if (!existsSync(claudeDir)) {
     mkdirSync(claudeDir, { recursive: true });
@@ -306,6 +310,39 @@ function installHooks() {
   }
 
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+  // Legacy cleanup: earlier installers wrote hooks into settings.local.json
+  // (never read outside home-directory sessions). Remove AgentDeck entries
+  // there, but never delete the file — it can hold user permission rules.
+  try {
+    const legacyPath = join(claudeDir, 'settings.local.json');
+    if (existsSync(legacyPath)) {
+      const legacyRaw = readFileSync(legacyPath, 'utf-8');
+      if (legacyRaw.includes('AGENTDECK_PORT') || legacyRaw.includes('localhost:9120') || legacyRaw.includes('claude-hook.ps1')) {
+        const legacy = JSON.parse(legacyRaw);
+        if (legacy.hooks) {
+          for (const event of HOOK_EVENTS) {
+            if (!legacy.hooks[event]) continue;
+            legacy.hooks[event] = legacy.hooks[event].filter((h: any) => {
+              const isOurs = (cmd: unknown) =>
+                typeof cmd === 'string' &&
+                (cmd.includes('AGENTDECK_PORT') || cmd.includes('localhost:9120') || cmd.includes('claude-hook.ps1'));
+              if (isOurs(h.command)) return false;
+              if (Array.isArray(h.hooks) && h.hooks.some((hh: any) => isOurs(hh.command))) return false;
+              return true;
+            });
+            if (legacy.hooks[event].length === 0) delete legacy.hooks[event];
+          }
+          if (Object.keys(legacy.hooks).length === 0) delete legacy.hooks;
+        }
+        writeFileSync(legacyPath, JSON.stringify(legacy, null, 2) + '\n');
+        info('Moved AgentDeck hooks out of legacy settings.local.json');
+      }
+    }
+  } catch {
+    // Best effort — a malformed legacy file must not block setup.
+  }
+
   ok(`Hooks installed to ${settingsPath}`);
 }
 
